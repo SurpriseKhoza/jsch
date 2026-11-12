@@ -149,3 +149,143 @@ See [ChangeLog.md](ChangeLog.md)
 
 
 #############################___New Implementations__##############
+
+
+To implement HTTP Injector-style SSH tunneling in your Android VPN app (V2-TUN) using JSch, you need to intercept the socket creation process via JSch's SocketFactory interface, inject your custom payload or TLS/SNI handshake before JSch starts its SSH protocol exchange, and then route your Android VpnService traffic through the resulting SOCKS5 tunnel.
+
+1. Maintain the Right JSch Fork
+
+The original JCraft JSch library is unmaintained and lacks modern cryptographic algorithms (such as ed25519, ecdsa-sha2, and modern rsa-sha2-256/512 host keys) required by contemporary OpenSSH servers.
+• Use the actively maintained community fork mwiede/jsch (com.github.mwiede:jsch) in your Android Gradle dependencies so your users do not hit Algorithm negotiation fail errors on modern VPS setups.
+
+2. Implement a Custom SocketFactory for Payload Injection
+
+JSch relies on com.jcraft.jsch.SocketFactory to open its underlying transport connection. By implementing this interface, you control what happens on the raw java.net.Socket before JSch sends the SSH-2.0-... banner.
+java
+import com.jcraft.jsch.SocketFactory;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+import java.util.Collections;
+
+public class CustomTunnelSocketFactory implements SocketFactory {
+    private final String proxyHost;
+    private final int proxyPort;
+    private final String rawPayload;
+    private final String sniHost;
+    private final boolean useSsl;
+
+    public CustomTunnelSocketFactory(String proxyHost, int proxyPort, String rawPayload, String sniHost, boolean useSsl) {
+        this.proxyHost = proxyHost;
+        this.proxyPort = proxyPort;
+        this.rawPayload = rawPayload;
+        this.sniHost = sniHost;
+        this.useSsl = useSsl;
+    }
+
+    @Override
+    public Socket createSocket(String sshHost, int sshPort) throws IOException {
+        Socket socket = new Socket();
+        // IMPORTANT: Protect this socket in your Android VpnService to prevent routing loops!
+        // MyVpnService.protectSocket(socket);
+        socket.connect(new InetSocketAddress(proxyHost, proxyPort), 10000);
+
+        if (useSsl) {
+            SSLSocketFactory sslFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+            SSLSocket sslSocket = (SSLSocket) sslFactory.createSocket(socket, proxyHost, proxyPort, true);
+            if (sniHost != null && !sniHost.isEmpty()) {
+                SSLParameters params = sslSocket.getSSLParameters();
+                params.setServerNames(Collections.singletonList(new SNIHostName(sniHost)));
+                sslSocket.setSSLParameters(params);
+            }
+            sslSocket.startHandshake();
+            socket = sslSocket;
+        }
+
+        if (rawPayload != null && !rawPayload.isEmpty()) {
+            OutputStream out = socket.getOutputStream();
+            InputStream in = socket.getInputStream();
+
+            String formattedPayload = formatPayload(rawPayload, sshHost, sshPort);
+            out.write(formattedPayload.getBytes(StandardCharsets.UTF_8));
+            out.flush();
+
+            // Read the HTTP proxy response header (e.g., HTTP/1.1 200 OK or 101 Switching Protocols)
+            // Note: Read byte-by-byte until "\r\n\r\n" so you don't over-read into the SSH server banner!
+            readHttpHeaders(in);
+        }
+
+        return socket;
+    }
+
+    private String formatPayload(String payload, String host, int port) {
+        return payload
+            .replace("[host_port]", host + ":" + port)
+            .replace("[host]", host)
+            .replace("[port]", String.valueOf(port))
+            .replace("[crlf]", "\r\n")
+            .replace("[lf]", "\n")
+            .replace("[cr]", "\r");
+    }
+
+    private void readHttpHeaders(InputStream in) throws IOException {
+        StringBuilder headerBuilder = new StringBuilder();
+        int b;
+        while ((b = in.read()) != -1) {
+            headerBuilder.append((char) b);
+            if (headerBuilder.toString().endsWith("\r\n\r\n")) {
+                break;
+            }
+        }
+        String response = headerBuilder.toString();
+        if (!response.contains(" 200 ") && !response.contains(" 101 ")) {
+            throw new IOException("Proxy rejected payload: " + response.split("\r\n")[0]);
+        }
+    }
+
+    @Override
+    public InputStream getInputStream(Socket socket) throws IOException {
+        return socket.getInputStream();
+    }
+
+    @Override
+    public OutputStream getOutputStream(Socket socket) throws IOException {
+        return socket.getOutputStream();
+    }
+}
+Use code with caution.
+
+3. Start the Local SOCKS5 Dynamic Forwarder
+
+Once your custom socket is connected, attach the SocketFactory to your JSch Session and start a local dynamic port forwarder (-D).
+java
+JSch jsch = new JSch();
+Session session = jsch.getSession(sshUser, sshHost, sshPort);
+session.setPassword(sshPassword);
+session.setConfig("StrictHostKeyChecking", "no");
+
+// Attach your custom socket factory
+session.setSocketFactory(new CustomTunnelSocketFactory(proxyHost, proxyPort, payload, sni, isSsl));
+session.connect(15000);
+
+// Open a local SOCKS5 proxy (e.g., 127.0.0.1:10808)
+int localSocksPort = session.setPortForwardingD("127.0.0.1", 10808);
+Use code with caution.
+
+4. Critical Android VpnService Integration Details
+
+Because V2-TUN operates at the TUN interface level on Android, keep three implementation details in mind:
+• Prevent VPN Routing Loops: Before calling socket.connect(...) inside your CustomTunnelSocketFactory, you must pass the raw Socket object to VpnService.protect(socket). Otherwise, the SSH tunnel's own outbound packets will be captured by your TUN interface and routed back into itself.
+• Avoid Buffered Readers on the Handshake: Never wrap the socket's InputStream in a BufferedReader when reading the proxy's HTTP 200/101 response. A BufferedReader reads chunks ahead (e.g., 8 KB) and will accidentally consume the server's SSH-2.0-OpenSSH... greeting, causing JSch to hang waiting for the SSH banner. Read byte-by-byte until \r\n\r\n.
+• TUN-to-SOCKS5 Bridge (tun2socks): Since JSch exposes a local SOCKS5 port (127.0.0.1:10808), pipe your VpnService TUN file descriptor into hev-socks5-tunnel or badvpn-tun2socks pointed at that local SOCKS5 port (just as V2Ray/Xray cores do on Android). If you need UDP/DNS forwarding over SSH, enable udpgw support in tun2socks or route DNS queries over TCP.
+If you'd like to dive deeper into any part of the V2-TUN integration, let me know:
+• How you are currently bridging your TUN interface (e.g., hev-socks5-tunnel, tun2socks, or Xray/Sing-box core)
+• Whether you also need SSH + WebSocket + CDN (Cloudflare) or SlowDNS (DNSTT) support alongside standard HTTP/SSL payloads
+I can provide the exact configuration or integration code for your setup.
